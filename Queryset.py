@@ -112,6 +112,7 @@ class Queryset(object):
 
         rng = random.Random(seed)
         pretrain_queries = []
+        pretrain_ids = set()
         finetune_folds = {}
         finetune_test_ratio = 1.0 - finetune_train_ratio - finetune_val_ratio
 
@@ -128,8 +129,17 @@ class Queryset(object):
             finetune_candidates = queries[pretrain_cnt:]
 
             pretrain_queries.extend(pretrain_subset)
+            pretrain_ids.update(map(id, pretrain_subset))
 
             folds = []
+            if len(finetune_candidates) == 0:
+                for _ in range(num_fold):
+                    folds.append(([], [], []))
+                finetune_folds[size] = folds
+                continue
+
+            finetune_candidates = [q for q in finetune_candidates if id(q) not in pretrain_ids]
+
             if len(finetune_candidates) == 0:
                 for _ in range(num_fold):
                     folds.append(([], [], []))
@@ -149,7 +159,26 @@ class Queryset(object):
                 folds.append((train_queries, val_queries, test_queries))
             finetune_folds[size] = folds
 
+        self._assert_disjoint_splits(pretrain_queries, finetune_folds)
+
         return pretrain_queries, finetune_folds
+
+    def _assert_disjoint_splits(self, pretrain_queries, finetune_folds):
+        """Ensure that the shared pre-train pool never overlaps with fine-tune folds."""
+
+        pretrain_ids = set(map(id, pretrain_queries))
+        for size, folds in finetune_folds.items():
+            for fold_idx, (train_queries, val_queries, test_queries) in enumerate(folds):
+                for split_name, split in (
+                    ("train", train_queries),
+                    ("val", val_queries),
+                    ("test", test_queries),
+                ):
+                    overlap = pretrain_ids.intersection(map(id, split))
+                    if overlap:
+                        raise RuntimeError(
+                            f"Pre-train and fine-tune data overlap for size {size}, fold {fold_idx + 1} ({split_name})."
+                        )
 
     def _split_single_fold(self, fold_queries, train_ratio, val_ratio, test_ratio):
         """Split a query list into train/val/test according to given ratios."""
