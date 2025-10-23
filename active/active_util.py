@@ -15,10 +15,10 @@ def _to_cuda(l):
 
 
 def _to_datasets(all_sets, num_classes = 10):
-	datasets = [QueryDataset(queries=queries, num_classes=10)
-				for queries in all_sets ] if isinstance(all_sets, list) \
-		else [ QueryDataset(queries=all_sets) ]
-	return datasets
+        datasets = [QueryDataset(queries=queries, num_classes=num_classes)
+                                for queries in all_sets ] if isinstance(all_sets, list) \
+                else [ QueryDataset(queries=all_sets, num_classes=num_classes) ]
+        return datasets
 
 def _to_dataloaders(datasets, batch_size = 1, shuffle = True):
 	"""

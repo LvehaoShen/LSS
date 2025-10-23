@@ -169,8 +169,19 @@ class CardNet(nn.Module):
 	def forward(self, decomp_x, decomp_edge_index, decomp_edge_attr):
 		g, output_cla = None, None
 
+		def _strip_leading_batch_dim(tensor):
+			"""Remove a leading singleton batch dimension while preserving feature axes."""
+
+			if not torch.is_tensor(tensor):
+				return tensor
+			if tensor.dim() > 0 and tensor.size(0) == 1 and tensor.dim() > 1:
+				return tensor.squeeze(0)
+			return tensor
+
 		for x, edge_index, edge_attr in zip(decomp_x, decomp_edge_index, decomp_edge_attr):
-			x, edge_index, edge_attr = x.squeeze(), edge_index.squeeze(), edge_attr.squeeze()
+			x = _strip_leading_batch_dim(x)
+			edge_index = _strip_leading_batch_dim(edge_index)
+			edge_attr = _strip_leading_batch_dim(edge_attr)
 			if g is None:
 				g = self.graph2vec(x, edge_index, edge_attr)
 			else:
