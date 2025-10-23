@@ -93,6 +93,7 @@ def pretrain_finetune_experiment(args):
 		print("=" * 40)
 
 		model = cardnet.CardNet(args, num_node_feat=num_node_feat, num_edge_feat=num_edge_feat)
+		model = model.to(args.device)
 		optimizer = optim.Adam(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
 		scheduler = optim.lr_scheduler.ExponentialLR(optimizer, gamma=args.decay_factor)
 
@@ -114,6 +115,7 @@ def pretrain_finetune_experiment(args):
 				continue
 
 			model_ft = cardnet.CardNet(args, num_node_feat=num_node_feat, num_edge_feat=num_edge_feat)
+			model_ft = model_ft.to(args.device)
 			model_ft.load_state_dict(pretrained_state)
 			optimizer_ft = optim.Adam(model_ft.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
 			scheduler_ft = optim.lr_scheduler.ExponentialLR(optimizer_ft, gamma=args.decay_factor)
