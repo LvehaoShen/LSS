@@ -12,266 +12,394 @@ from torch.utils.data import DataLoader
 
 
 class Queryset(object):
-	def __init__(self, args, all_subsets):
-		"""
-		all_subsets: {(size, patten) -> [(graphs, true_card]} // all queries subset
-		"""
-		self.args = args
-		self.data_dir = args.data_dir
-		self.dataset = args.dataset
-		self.num_queries = 0
+    def __init__(self, args, all_subsets):
+        """Manage query splits and tensorization for downstream training."""
 
-		# load the data graph and its statistical information
-		self.data_graph = DataGraph(data_dir = self.data_dir, dataset = self.dataset)
-		self.node_label_card, self.edge_label_card = self.data_graph.node_label_card, self.data_graph.edge_label_card
+        self.args = args
+        self.data_dir = args.data_dir
+        self.dataset = args.dataset
+        self.num_queries = 0
 
-		self.num_nodes = self.data_graph.num_nodes
-		self.num_edges = self.data_graph.num_edges
-		self.node_label_fre = 0
-		self.edge_label_fre = 0
+        # load the data graph and its statistical information
+        self.data_graph = DataGraph(data_dir=self.data_dir, dataset=self.dataset)
+        self.node_label_card = self.data_graph.node_label_card
+        self.edge_label_card = self.data_graph.edge_label_card
 
+        self.num_nodes = self.data_graph.num_nodes
+        self.num_edges = self.data_graph.num_edges
+        self.node_label_fre = 0
+        self.edge_label_fre = 0
 
-		self.label_dict = self.load_label_mapping() if self.dataset == 'aids' or self.dataset == 'aids_gen' else \
-			{key: key for key in self.node_label_card.keys()}  # label_id -> embed_id
-		embed_feat_path = os.path.join(args.embed_feat_dir, "{}.emb.npy".format(args.dataset))
-		embed_feat = np.load(embed_feat_path)
+        self.label_dict = (
+            self.load_label_mapping()
+            if self.dataset == "aids" or self.dataset == "aids_gen"
+            else {key: key for key in self.node_label_card.keys()}
+        )  # label_id -> embed_id
+        embed_feat_path = os.path.join(args.embed_feat_dir, f"{args.dataset}.emb.npy")
+        embed_feat = np.load(embed_feat_path)
 
-		#assert embed_feat.shape[0] == len(self.node_label_card) + 1, "prone embedding size error!"
-		self.embed_dim = embed_feat.shape[1]
-		self.embed_feat = torch.from_numpy(embed_feat)
-		if self.args.embed_type == "freq":
-			self.num_node_feat = len(self.node_label_card)
-		elif self.args.embed_type == "n2v" or self.args.embed_type == "prone" or self.args.embed_type == "nrp":
-			self.num_node_feat = self.embed_dim
-		else:
-			self.num_node_feat = self.embed_dim + len(self.node_label_card)
+        # assert embed_feat.shape[0] == len(self.node_label_card) + 1, "prone embedding size error!"
+        self.embed_dim = embed_feat.shape[1]
+        self.embed_feat = torch.from_numpy(embed_feat)
+        if self.args.embed_type == "freq":
+            self.num_node_feat = len(self.node_label_card)
+        elif self.args.embed_type in ("n2v", "prone", "nrp"):
+            self.num_node_feat = self.embed_dim
+        else:
+            self.num_node_feat = self.embed_dim + len(self.node_label_card)
 
-		if self.args.edge_embed_type == "freq":
-			self.edge_embed_feat = None
-			self.edge_embed_dim = 0
-			self.num_edge_feat = len(self.edge_label_card)
-		else:
-			edge_embed_feat_path = os.path.join(args.embed_feat_dir, "{}_edge.emb.npy".format(args.dataset))
-			edge_embed_feat = np.load(edge_embed_feat_path)
-			self.edge_embed_dim = edge_embed_feat.shape[1]
-			self.edge_embed_feat = torch.from_numpy(edge_embed_feat)
-			self.num_edge_feat = self.edge_embed_dim
+        if self.args.edge_embed_type == "freq":
+            self.edge_embed_feat = None
+            self.edge_embed_dim = 0
+            self.num_edge_feat = len(self.edge_label_card)
+        else:
+            edge_embed_feat_path = os.path.join(args.embed_feat_dir, f"{args.dataset}_edge.emb.npy")
+            edge_embed_feat = np.load(edge_embed_feat_path)
+            self.edge_embed_dim = edge_embed_feat.shape[1]
+            self.edge_embed_feat = torch.from_numpy(edge_embed_feat)
+            self.num_edge_feat = self.edge_embed_dim
 
+        # transform the decomposed query to torch tensor
+        self.all_subsets = self.transform_query_to_tensors(all_subsets)
 
-		# transform the decomposed query to torch tensor
-		self.all_subsets = self.transform_query_to_tensors(all_subsets)
+        self.all_queries = []
+        # split by query patterns and sizes
+        self.all_sizes = {}  # { size -> [(graphs, true_card]} // all queries subset indexed by query size
+        self.all_patterns = {}  # { pattern -> [(graphs, true_card)]} // all queries subset index by query pattern
 
-		self.all_queries = []
-		# split by query patterns and sizes
-		self.all_sizes = {} # { size -> [(graphs, true_card]} // all queries subset indexed by query size
-		self.all_patterns = {} # { pattern -> [(graphs, true_card)]} // all queries subset index by query pattern
+        for (pattern, size), graphs_card_pairs in self.all_subsets.items():
+            self.all_queries += graphs_card_pairs
+            if pattern not in self.all_patterns:
+                self.all_patterns[pattern] = []
+            self.all_patterns[pattern] += graphs_card_pairs
+            if size not in self.all_sizes:
+                self.all_sizes[size] = []
+            self.all_sizes[size] += graphs_card_pairs
 
-		for (pattern, size), graphs_card_pairs in self.all_subsets.items():
-			self.all_queries += graphs_card_pairs
-			if pattern not in self.all_patterns.keys():
-				self.all_patterns[pattern] = []
-			self.all_patterns[pattern] += graphs_card_pairs
-			if size not in self.all_sizes.keys():
-				self.all_sizes[size] = []
-			self.all_sizes[size] += graphs_card_pairs
+        # split to train, val, test query set
+        self.num_train_queries, self.num_val_queries, self.num_test_queries = 0, 0, 0
+        train_sets, val_sets, test_sets, all_train_sets = self.data_split(
+            self.all_sizes, train_ratio=0.8, val_ratio=0.1
+        )
+        # train_sets, val_sets, test_sets, all_train_sets = self.uneven_data_split(self.all_sizes, train_ratio=0.5,
+        # val_ratio=0.4)
 
+        self.train_loaders = self.to_dataloader(all_sets=train_sets)
+        self.val_loaders = self.to_dataloader(all_sets=val_sets)
+        self.test_loaders = self.to_dataloader(all_sets=test_sets)
+        self.all_train_loaders = self.to_dataloader(all_sets=all_train_sets)
+        self.train_sets, self.val_sets, self.test_sets, self.all_train_sets = (
+            train_sets,
+            val_sets,
+            test_sets,
+            all_train_sets,
+        )
 
-		# split to train, val, test query set
-		self.num_train_queries , self.num_val_queries, self.num_test_queries = 0, 0, 0
-		train_sets, val_sets, test_sets, all_train_sets = self.data_split(self.all_sizes, train_ratio= 0.8, val_ratio=0.1)
-		#train_sets, val_sets, test_sets, all_train_sets = self.uneven_data_split(self.all_sizes, train_ratio=0.5,
-		#																  val_ratio=0.4)
+    def build_pretrain_finetune_splits(
+        self,
+        pretrain_ratio=0.2,
+        num_fold=5,
+        finetune_train_ratio=0.8,
+        finetune_val_ratio=0.1,
+        seed=1,
+    ):
+        """Create shared pre-training data and size-wise fine-tuning folds."""
 
-		self.train_loaders = self.to_dataloader(all_sets= train_sets)
-		self.val_loaders = self.to_dataloader(all_sets= val_sets)
-		self.test_loaders = self.to_dataloader(all_sets= test_sets)
-		self.all_train_loaders = self.to_dataloader(all_sets = all_train_sets)
-		self.train_sets, self.val_sets, self.test_sets, self.all_train_sets = train_sets, val_sets, test_sets, all_train_sets
+        assert 0.0 <= pretrain_ratio < 1.0, "pretrain ratio must be in [0, 1)."
+        assert (
+            finetune_train_ratio + finetune_val_ratio <= 1.0
+        ), "fine-tune ratios must sum to <= 1."
 
+        rng = random.Random(seed)
+        pretrain_queries = []
+        finetune_folds = {}
+        finetune_test_ratio = 1.0 - finetune_train_ratio - finetune_val_ratio
 
-	def data_split(self, all_sets, train_ratio = 0.6, val_ratio = 0.2, seed = 1):
-		"""
-		all_sets: self.all_sets or self.all_patterns
-		test_ratio = 1 - train_ratio - val_ratio
-		"""
-		assert train_ratio + val_ratio <= 1.0, "Error data split ratio!"
-		random.seed(seed)
-		train_sets, val_sets, test_sets = [], [], []
-		all_train_sets = [ [] ]
-		for key in sorted(all_sets.keys()):
-			num_instances = len(all_sets[key])
-			random.shuffle(all_sets[key])
-			train_sets.append(all_sets[key][ : int(num_instances * train_ratio)])
-			# merge to all_train_sets
-			all_train_sets[-1] = all_train_sets[-1] + train_sets[-1]
-			val_sets.append(all_sets[key][int(num_instances * train_ratio): int(num_instances * (train_ratio + val_ratio))])
-			test_sets.append(all_sets[key][int(num_instances * (train_ratio + val_ratio)): ])
-			self.num_train_queries += len(train_sets[-1])
-			self.num_val_queries += len(val_sets[-1])
-			self.num_test_queries += len(test_sets[-1])
-		return train_sets, val_sets, test_sets, all_train_sets
+        for size in sorted(self.all_sizes.keys()):
+            queries = list(self.all_sizes[size])
+            if len(queries) == 0:
+                continue
+            rng.shuffle(queries)
+            pretrain_cnt = int(len(queries) * pretrain_ratio)
+            if pretrain_cnt >= len(queries):
+                pretrain_cnt = len(queries) - 1 if len(queries) > 1 else len(queries)
 
-	def uneven_data_split(self, all_sets, train_ratio=0.6, val_ratio=0.2, large_ratio = 0.6, small_ratio = 0.4, seed=1):
-		"""
-		split a training query set with uneven large/small query graphs
-		large_ratio: specified large to small query ratio in the training set
-		all_sets: self.all_sizes
-		test_ratio = 1 - train_ratio - val_ratio
-		"""
-		assert train_ratio + val_ratio <= 1.0, "Error train/val/test data split ratio!"
-		assert large_ratio + small_ratio == 1.0, "Error large/small data split ratio!"
-		print("large/small ratio: {}/{}".format(large_ratio, small_ratio))
-		random.seed(seed)
-		tmp_train_sets = {}
-		train_sets, val_sets, test_sets = [], [], []
-		# Split the train/val/test dataset
-		for key in sorted(all_sets.keys()):
-			num_instances = len(all_sets[key]) # queries in the current subset
-			random.shuffle(all_sets[key])
-			tmp_train_sets[key] = all_sets[key][ : int(num_instances * train_ratio)]
-			val_sets.append(all_sets[key][int(num_instances * train_ratio): int(num_instances * (train_ratio + val_ratio))])
-			test_sets.append(all_sets[key][int(num_instances * (train_ratio + val_ratio)): ])
-			self.num_val_queries += len(val_sets[-1])
-			self.num_test_queries += len(test_sets[-1])
-		median_size = statistics.median(list(all_sets.keys()))
-		small_sizes = [size for size in list(all_sets.keys()) if size <= median_size]
-		large_sizes = [size for size in list(all_sets.keys()) if size > median_size]
-		all_train_sets = [[]]
-		# sample an uneven training dataset
-		for key in sorted(all_sets.keys()):
-			num_instances = len(tmp_train_sets[key])
-			if key in small_sizes:
-				train_sets.append(random.sample(tmp_train_sets[key], k=int(num_instances * small_ratio)))
-			elif key in large_sizes:
-				train_sets.append(random.sample(tmp_train_sets[key], k=int(num_instances * large_ratio)))
-			all_train_sets[-1] = all_train_sets[-1] + train_sets[-1]
-			self.num_train_queries += len(train_sets[-1])
-		return train_sets, val_sets, test_sets, all_train_sets
+            pretrain_subset = queries[:pretrain_cnt]
+            finetune_candidates = queries[pretrain_cnt:]
 
+            pretrain_queries.extend(pretrain_subset)
 
-	def to_dataloader(self, all_sets, batch_size = 1, shuffle = True):
-		datasets = [ QueryDataset(queries= queries)
-					 for queries in all_sets]
-		dataloaders = [ DataLoader(dataset= dataset, batch_size = batch_size, shuffle= shuffle)
-						for dataset in datasets]
-		return dataloaders
+            folds = []
+            if len(finetune_candidates) == 0:
+                for _ in range(num_fold):
+                    folds.append(([], [], []))
+                finetune_folds[size] = folds
+                continue
 
+            for fold_idx in range(num_fold):
+                fold_rng = random.Random(seed + size * 9973 + fold_idx)
+                fold_queries = list(finetune_candidates)
+                fold_rng.shuffle(fold_queries)
+                train_queries, val_queries, test_queries = self._split_single_fold(
+                    fold_queries,
+                    train_ratio=finetune_train_ratio,
+                    val_ratio=finetune_val_ratio,
+                    test_ratio=finetune_test_ratio,
+                )
+                folds.append((train_queries, val_queries, test_queries))
+            finetune_folds[size] = folds
 
-	def transform_query_to_tensors(self, all_subsets):
-		tmp_subsets = {}
-		for (pattern, size), graphs_card_pairs in all_subsets.items():
-			tmp_subsets[(pattern, size)] = []
-			for (graphs, card) in graphs_card_pairs:
-				decomp_x, decomp_edge_index, decomp_edge_attr, _ = \
-					self._get_decomposed_graph_data(graphs)
-				tmp_subsets[(pattern, size)].append((decomp_x, decomp_edge_index, decomp_edge_attr, card))
-				self.num_queries += 1
+        return pretrain_queries, finetune_folds
 
-		return tmp_subsets
+    def _split_single_fold(self, fold_queries, train_ratio, val_ratio, test_ratio):
+        """Split a query list into train/val/test according to given ratios."""
 
+        num_instances = len(fold_queries)
+        if num_instances == 0:
+            return [], [], []
 
-	def _get_decomposed_graph_data(self, graphs, card = None):
-		decomp_x = []
-		decomp_edge_index = []
-		decomp_edge_attr = []
-		for graph in graphs:
-			if self.args.embed_type == "freq":
-				node_attr = self._get_nodes_attr_freq(graph)
-			elif self.args.embed_type == "n2v" or self.args.embed_type == "prone" or self.args.embed_type == "nrp":
-				node_attr = self._get_nodes_attr_embed(graph)
-			else:
-				node_attr_freq, node_attr_embed = self._get_nodes_attr_freq(graph), self._get_nodes_attr_embed(graph)
-				node_attr = torch.cat([node_attr_freq, node_attr_embed], dim=1)
+        train_end = int(num_instances * train_ratio)
+        val_end = train_end + int(num_instances * val_ratio)
 
-			if self.args.edge_embed_type == "freq":
-				edge_index, edge_attr = self._get_edges_index_freq(graph)
-			else:
-				edge_index, edge_attr = self._get_edges_index_embed(graph)
-			decomp_x.append(node_attr)
-			decomp_edge_index.append(edge_index)
-			decomp_edge_attr.append(edge_attr)
-		return decomp_x, decomp_edge_index, decomp_edge_attr, card
+        if train_end == 0 and num_instances > 0:
+            train_end = 1
+        if val_end <= train_end and num_instances - train_end > 1:
+            val_end = train_end + 1
+        if val_end >= num_instances:
+            val_end = num_instances - 1 if num_instances > 1 else num_instances
 
-	def _get_nodes_attr(self, graph):
-		node_attr = torch.zeros(size=(graph.number_of_nodes(), self.num_node_feat), dtype= torch.float)
-		for v in graph.nodes():
-			if len(graph.nodes[v]["labels"]) == 0:
-				continue
-			for label in graph.nodes[v]["labels"]:
-				node_attr[v] += self.embed_feat[self.label_dict[label]]
-				self.node_label_fre += 1
-		return node_attr
+        train_queries = fold_queries[:train_end]
+        val_queries = fold_queries[train_end:val_end]
+        test_queries = fold_queries[val_end:]
 
-	def _get_nodes_attr_freq(self, graph):
-		node_attr = torch.ones(size=(graph.number_of_nodes(), len(self.node_label_card)), dtype=torch.float)
-		for v in graph.nodes():
-			for label in graph.nodes[v]["labels"]:
-				node_attr[v][self.label_dict[label]] = self.node_label_card[label]
-				self.node_label_fre += 1
-		return node_attr
+        if len(val_queries) == 0 and len(train_queries) > 1:
+            val_queries = [train_queries.pop()]
+        if len(test_queries) == 0 and len(train_queries) > 1:
+            test_queries = [train_queries.pop()]
+        if len(test_queries) == 0 and len(val_queries) > 1:
+            test_queries = [val_queries.pop()]
 
-	def _get_nodes_attr_embed(self, graph):
-		node_attr = torch.zeros(size=(graph.number_of_nodes(), self.embed_dim), dtype=torch.float)
-		for v in graph.nodes():
-			if len(graph.nodes[v]["labels"]) == 0:
-				continue
-			for label in graph.nodes[v]["labels"]:
-				node_attr[v] += self.embed_feat[self.label_dict[label]]
-				self.node_label_fre += 1
-		return node_attr
+        return train_queries, val_queries, test_queries
 
+    def data_split(self, all_sets, train_ratio=0.6, val_ratio=0.2, seed=1):
+        """
+        all_sets: self.all_sets or self.all_patterns
+        test_ratio = 1 - train_ratio - val_ratio
+        """
 
-	def _get_edges_index_freq(self, graph):
-		edge_index = torch.ones(size= (2, graph.number_of_edges()), dtype = torch.long)
-		edge_attr = torch.zeros(size= (graph.number_of_edges(), len(self.edge_label_card)), dtype=torch.float)
-		cnt = 0
-		for e in graph.edges():
-			edge_index[0][cnt], edge_index[1][cnt] = e[0], e[1]
-			for label in graph.edges[e]["labels"]:
-				edge_attr[cnt][label] = self.edge_label_card[label]
-				self.edge_label_fre += 1
-			cnt += 1
-		return edge_index, edge_attr
+        assert train_ratio + val_ratio <= 1.0, "Error data split ratio!"
+        random.seed(seed)
+        train_sets, val_sets, test_sets = [], [], []
+        all_train_sets = [[]]
+        for key in sorted(all_sets.keys()):
+            num_instances = len(all_sets[key])
+            random.shuffle(all_sets[key])
+            train_sets.append(all_sets[key][: int(num_instances * train_ratio)])
+            # merge to all_train_sets
+            all_train_sets[-1] = all_train_sets[-1] + train_sets[-1]
+            val_sets.append(
+                all_sets[key][
+                    int(num_instances * train_ratio) : int(
+                        num_instances * (train_ratio + val_ratio)
+                    )
+                ]
+            )
+            test_sets.append(all_sets[key][int(num_instances * (train_ratio + val_ratio)) :])
+            self.num_train_queries += len(train_sets[-1])
+            self.num_val_queries += len(val_sets[-1])
+            self.num_test_queries += len(test_sets[-1])
+        return train_sets, val_sets, test_sets, all_train_sets
 
-	def _get_edges_index_embed(self, graph):
-		edge_index = torch.ones(size= (2, graph.number_of_edges()), dtype = torch.long)
-		edge_attr = torch.zeros(size= (graph.number_of_edges(), self.edge_embed_dim), dtype=torch.float)
-		cnt = 0
-		for e in graph.edges():
-			edge_index[0][cnt], edge_index[1][cnt] = e[0], e[1]
-			for label in graph.edges[e]["labels"]:
-				edge_attr[cnt] += self.edge_embed_feat[label]
-				self.edge_label_fre += 1
-			cnt += 1
-		return edge_index, edge_attr
+    def uneven_data_split(
+        self,
+        all_sets,
+        train_ratio=0.6,
+        val_ratio=0.2,
+        large_ratio=0.6,
+        small_ratio=0.4,
+        seed=1,
+    ):
+        """
+        split a training query set with uneven large/small query graphs
+        large_ratio: specified large to small query ratio in the training set
+        all_sets: self.all_sizes
+        test_ratio = 1 - train_ratio - val_ratio
+        """
 
-	def load_label_mapping(self):
-		map_load_path = os.path.join(self.args.embed_feat_dir, "{}_mapping.txt".format(self.dataset))
-		assert os.path.exists(map_load_path), "The label mapping file is not exists!"
-		label_dict = {} # label_id -> embed_id
-		cnt = 0
-		with open(map_load_path, "r") as in_file:
-			for line in in_file:
-				label_id = int(line.strip())
-				label_dict[label_id] = cnt
-				cnt += 1
-			in_file.close()
-		return label_dict
+        assert train_ratio + val_ratio <= 1.0, "Error train/val/test data split ratio!"
+        assert large_ratio + small_ratio == 1.0, "Error large/small data split ratio!"
+        print("large/small ratio: {}/{}".format(large_ratio, small_ratio))
+        random.seed(seed)
+        tmp_train_sets = {}
+        train_sets, val_sets, test_sets = [], [], []
+        # Split the train/val/test dataset
+        for key in sorted(all_sets.keys()):
+            num_instances = len(all_sets[key])  # queries in the current subset
+            random.shuffle(all_sets[key])
+            tmp_train_sets[key] = all_sets[key][: int(num_instances * train_ratio)]
+            val_sets.append(
+                all_sets[key][
+                    int(num_instances * train_ratio) : int(
+                        num_instances * (train_ratio + val_ratio)
+                    )
+                ]
+            )
+            test_sets.append(all_sets[key][int(num_instances * (train_ratio + val_ratio)) :])
+            self.num_val_queries += len(val_sets[-1])
+            self.num_test_queries += len(test_sets[-1])
+        median_size = statistics.median(list(all_sets.keys()))
+        small_sizes = [size for size in list(all_sets.keys()) if size <= median_size]
+        large_sizes = [size for size in list(all_sets.keys()) if size > median_size]
+        all_train_sets = [[]]
+        # sample an uneven training dataset
+        for key in sorted(all_sets.keys()):
+            num_instances = len(tmp_train_sets[key])
+            if key in small_sizes:
+                train_sets.append(
+                    random.sample(tmp_train_sets[key], k=int(num_instances * small_ratio))
+                )
+            elif key in large_sizes:
+                train_sets.append(
+                    random.sample(tmp_train_sets[key], k=int(num_instances * large_ratio))
+                )
+            all_train_sets[-1] = all_train_sets[-1] + train_sets[-1]
+            self.num_train_queries += len(train_sets[-1])
+        return train_sets, val_sets, test_sets, all_train_sets
 
-	def print_queryset_info(self):
-		print("<" * 80)
-		print("Query Set Profile:")
-		print("# Total Queries: {}".format(self.num_queries))
-		print("# Train Queries: {}".format(self.num_train_queries))
-		print("# Val Queries: {}".format(self.num_val_queries))
-		print("# Test Queries: {}".format(self.num_test_queries))
-		print("# Node Feat: {}".format(self.num_node_feat))
-		print("# Edge Feat: {}".format(self.num_edge_feat))
-		print("# Node label fre: {}".format(self.node_label_fre))
-		print("# Edge label fre: {}".format(self.edge_label_fre))
-		print(">" * 80)
+    def to_dataloader(self, all_sets, batch_size=1, shuffle=True):
+        datasets = [QueryDataset(queries=queries) for queries in all_sets]
+        dataloaders = [
+            DataLoader(dataset=dataset, batch_size=batch_size, shuffle=shuffle)
+            for dataset in datasets
+        ]
+        return dataloaders
 
+    def transform_query_to_tensors(self, all_subsets):
+        tmp_subsets = {}
+        for (pattern, size), graphs_card_pairs in all_subsets.items():
+            tmp_subsets[(pattern, size)] = []
+            for (graphs, card) in graphs_card_pairs:
+                decomp_x, decomp_edge_index, decomp_edge_attr, _ = self._get_decomposed_graph_data(
+                    graphs
+                )
+                tmp_subsets[(pattern, size)].append(
+                    (decomp_x, decomp_edge_index, decomp_edge_attr, card)
+                )
+                self.num_queries += 1
 
+        return tmp_subsets
+
+    def _get_decomposed_graph_data(self, graphs, card=None):
+        decomp_x = []
+        decomp_edge_index = []
+        decomp_edge_attr = []
+        for graph in graphs:
+            if self.args.embed_type == "freq":
+                node_attr = self._get_nodes_attr_freq(graph)
+            elif self.args.embed_type in ("n2v", "prone", "nrp"):
+                node_attr = self._get_nodes_attr_embed(graph)
+            else:
+                node_attr_freq = self._get_nodes_attr_freq(graph)
+                node_attr_embed = self._get_nodes_attr_embed(graph)
+                node_attr = torch.cat([node_attr_freq, node_attr_embed], dim=1)
+
+            if self.args.edge_embed_type == "freq":
+                edge_index, edge_attr = self._get_edges_index_freq(graph)
+            else:
+                edge_index, edge_attr = self._get_edges_index_embed(graph)
+            decomp_x.append(node_attr)
+            decomp_edge_index.append(edge_index)
+            decomp_edge_attr.append(edge_attr)
+        return decomp_x, decomp_edge_index, decomp_edge_attr, card
+
+    def _get_nodes_attr(self, graph):
+        node_attr = torch.zeros(
+            size=(graph.number_of_nodes(), self.num_node_feat), dtype=torch.float
+        )
+        for v in graph.nodes():
+            if len(graph.nodes[v]["labels"]) == 0:
+                continue
+            for label in graph.nodes[v]["labels"]:
+                node_attr[v] += self.embed_feat[self.label_dict[label]]
+                self.node_label_fre += 1
+        return node_attr
+
+    def _get_nodes_attr_freq(self, graph):
+        node_attr = torch.ones(
+            size=(graph.number_of_nodes(), len(self.node_label_card)), dtype=torch.float
+        )
+        for v in graph.nodes():
+            for label in graph.nodes[v]["labels"]:
+                node_attr[v][self.label_dict[label]] = self.node_label_card[label]
+                self.node_label_fre += 1
+        return node_attr
+
+    def _get_nodes_attr_embed(self, graph):
+        node_attr = torch.zeros(
+            size=(graph.number_of_nodes(), self.embed_dim), dtype=torch.float
+        )
+        for v in graph.nodes():
+            if len(graph.nodes[v]["labels"]) == 0:
+                continue
+            for label in graph.nodes[v]["labels"]:
+                node_attr[v] += self.embed_feat[self.label_dict[label]]
+                self.node_label_fre += 1
+        return node_attr
+
+    def _get_edges_index_freq(self, graph):
+        edge_index = torch.ones(size=(2, graph.number_of_edges()), dtype=torch.long)
+        edge_attr = torch.zeros(
+            size=(graph.number_of_edges(), len(self.edge_label_card)), dtype=torch.float
+        )
+        cnt = 0
+        for e in graph.edges():
+            edge_index[0][cnt], edge_index[1][cnt] = e[0], e[1]
+            for label in graph.edges[e]["labels"]:
+                edge_attr[cnt][label] = self.edge_label_card[label]
+                self.edge_label_fre += 1
+            cnt += 1
+        return edge_index, edge_attr
+
+    def _get_edges_index_embed(self, graph):
+        edge_index = torch.ones(size=(2, graph.number_of_edges()), dtype=torch.long)
+        edge_attr = torch.zeros(
+            size=(graph.number_of_edges(), self.edge_embed_dim), dtype=torch.float
+        )
+        cnt = 0
+        for e in graph.edges():
+            edge_index[0][cnt], edge_index[1][cnt] = e[0], e[1]
+            for label in graph.edges[e]["labels"]:
+                edge_attr[cnt] += self.edge_embed_feat[label]
+                self.edge_label_fre += 1
+            cnt += 1
+        return edge_index, edge_attr
+
+    def load_label_mapping(self):
+        map_load_path = os.path.join(
+            self.args.embed_feat_dir, "{}_mapping.txt".format(self.dataset)
+        )
+        assert os.path.exists(map_load_path), "The label mapping file is not exists!"
+        label_dict = {}  # label_id -> embed_id
+        cnt = 0
+        with open(map_load_path, "r") as in_file:
+            for line in in_file:
+                label_id = int(line.strip())
+                label_dict[label_id] = cnt
+                cnt += 1
+        return label_dict
+
+    def print_queryset_info(self):
+        print("<" * 80)
+        print("Query Set Profile:")
+        print("# Total Queries: {}".format(self.num_queries))
+        print("# Train Queries: {}".format(self.num_train_queries))
+        print("# Val Queries: {}".format(self.num_val_queries))
+        print("# Test Queries: {}".format(self.num_test_queries))
+        print("# Node Feat: {}".format(self.num_node_feat))
+        print("# Edge Feat: {}".format(self.num_edge_feat))
+        print("# Node label fre: {}".format(self.node_label_fre))
+        print("# Edge label fre: {}".format(self.edge_label_fre))
+        print(">" * 80)
 
 
 class DataGraph(object):
