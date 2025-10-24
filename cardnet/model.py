@@ -3,7 +3,39 @@ import torch.nn as nn
 import torch
 import torch.nn.functional as F
 from .layers import MLP, FC
-from torch_scatter import scatter_mean
+
+try:
+        from torch_scatter import scatter_mean  # type: ignore
+except (ImportError, OSError):
+
+        def scatter_mean(src, index=None, dim=0, dim_size=None):
+                """Fallback implementation when torch_scatter is unavailable."""
+
+                if index is None:
+                        return torch.mean(src, dim=dim)
+
+                if dim != 0:
+                        raise RuntimeError(
+                                "Fallback scatter_mean only supports dim=0. Install torch_scatter "
+                                "for broader axis support." )
+
+                if dim_size is None:
+                        dim_size = int(torch.max(index).item()) + 1 if index.numel() > 0 else 0
+
+                out_shape = (dim_size,) + tuple(src.shape[1:])
+                out = torch.zeros(out_shape, dtype=src.dtype, device=src.device)
+
+                index_expand = index.view(index.shape[0], *([1] * (src.dim() - 1))).expand_as(src)
+                out.scatter_add_(0, index_expand, src)
+
+                count_dtype = src.dtype if torch.is_floating_point(src) else torch.float32
+                count = torch.zeros(dim_size, dtype=count_dtype, device=src.device)
+                ones = torch.ones(index.shape[0], dtype=count_dtype, device=src.device)
+                count.scatter_add_(0, index, ones)
+
+                count = count.clamp_min(1).view(dim_size, *([1] * (src.dim() - 1)))
+                return out / count
+
 from torch_geometric.nn import GINConv, GINEConv, NNConv, GATConv, GraphConv, SAGEConv
 from .GINlayers import NNGINConv, NNGINConcatConv
 
@@ -169,8 +201,19 @@ class CardNet(nn.Module):
 	def forward(self, decomp_x, decomp_edge_index, decomp_edge_attr):
 		g, output_cla = None, None
 
+		def _strip_leading_batch_dim(tensor):
+			"""Remove a leading singleton batch dimension while preserving feature axes."""
+
+			if not torch.is_tensor(tensor):
+				return tensor
+			if tensor.dim() > 0 and tensor.size(0) == 1 and tensor.dim() > 1:
+				return tensor.squeeze(0)
+			return tensor
+
 		for x, edge_index, edge_attr in zip(decomp_x, decomp_edge_index, decomp_edge_attr):
-			x, edge_index, edge_attr = x.squeeze(), edge_index.squeeze(), edge_attr.squeeze()
+			x = _strip_leading_batch_dim(x)
+			edge_index = _strip_leading_batch_dim(edge_index)
+			edge_attr = _strip_leading_batch_dim(edge_attr)
 			if g is None:
 				g = self.graph2vec(x, edge_index, edge_attr)
 			else:
