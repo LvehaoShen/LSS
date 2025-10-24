@@ -3,7 +3,39 @@ import torch.nn as nn
 import torch
 import torch.nn.functional as F
 from .layers import MLP, FC
-from torch_scatter import scatter_mean
+
+try:
+        from torch_scatter import scatter_mean  # type: ignore
+except (ImportError, OSError):
+
+        def scatter_mean(src, index=None, dim=0, dim_size=None):
+                """Fallback implementation when torch_scatter is unavailable."""
+
+                if index is None:
+                        return torch.mean(src, dim=dim)
+
+                if dim != 0:
+                        raise RuntimeError(
+                                "Fallback scatter_mean only supports dim=0. Install torch_scatter "
+                                "for broader axis support." )
+
+                if dim_size is None:
+                        dim_size = int(torch.max(index).item()) + 1 if index.numel() > 0 else 0
+
+                out_shape = (dim_size,) + tuple(src.shape[1:])
+                out = torch.zeros(out_shape, dtype=src.dtype, device=src.device)
+
+                index_expand = index.view(index.shape[0], *([1] * (src.dim() - 1))).expand_as(src)
+                out.scatter_add_(0, index_expand, src)
+
+                count_dtype = src.dtype if torch.is_floating_point(src) else torch.float32
+                count = torch.zeros(dim_size, dtype=count_dtype, device=src.device)
+                ones = torch.ones(index.shape[0], dtype=count_dtype, device=src.device)
+                count.scatter_add_(0, index, ones)
+
+                count = count.clamp_min(1).view(dim_size, *([1] * (src.dim() - 1)))
+                return out / count
+
 from torch_geometric.nn import GINConv, GINEConv, NNConv, GATConv, GraphConv, SAGEConv
 from .GINlayers import NNGINConv, NNGINConcatConv
 
